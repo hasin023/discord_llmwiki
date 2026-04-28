@@ -29,10 +29,5 @@ data/cache/
 Thumbs.db
 
 # Wiki (generated content — optionally track in git)
-# wiki/entities/
-# wiki/topics/
-# wiki/channels/
-# wiki/timeline/
-# wiki/synthesis/
-# wiki/resources/
+wiki/
 .agent/
