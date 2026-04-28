@@ -32,7 +32,9 @@ class DuplicateDetector:
             return False
 
         results = await asyncio.to_thread(
-            self.memory.search, event.content, limit=5,
+            self.memory.search, event.content,
+            agent_id=f"channel_{event.channel_id}",
+            limit=5,
         )
         facts = results.get("results", []) if isinstance(results, dict) else results
 

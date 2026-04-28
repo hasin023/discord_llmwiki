@@ -11,7 +11,14 @@ Startup sequence:
 7. IngestionWorker
 8. Load cogs + sync slash commands
 """
+import warnings
 import asyncio
+
+# ── Suppress known third-party warnings (must run before imports) ────
+# warnings.filterwarnings("ignore", message="Field \"model_used\" has conflict with protected namespace")
+# warnings.filterwarnings("ignore", message="All support for the `google.generativeai` package has ended")
+# warnings.filterwarnings("ignore", message="parameter 'timeout' of type 'float' is deprecated")
+
 import discord
 from discord.ext import commands, tasks
 

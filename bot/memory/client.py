@@ -10,6 +10,21 @@ from utils.logging_setup import get_logger
 logger = get_logger(__name__)
 
 
+import google.generativeai as genai
+
+# --- Runtime Patch for mem0ai Gemini function calling bug ---
+_original_generate_content = genai.GenerativeModel.generate_content
+
+def _patched_generate_content(self, contents, **kwargs):
+    # If tool_config is passed but tools is empty, the API throws an error.
+    # We strip tool_config if tools are absent or empty to prevent the 400 error.
+    if "tool_config" in kwargs and not kwargs.get("tools"):
+        del kwargs["tool_config"]
+    return _original_generate_content(self, contents, **kwargs)
+
+genai.GenerativeModel.generate_content = _patched_generate_content
+# ------------------------------------------------------------
+
 @lru_cache(maxsize=1)
 def get_memory_client() -> Memory:
     """
@@ -23,7 +38,7 @@ def get_memory_client() -> Memory:
     """
     mem0_config = {
         "llm": {
-            "provider": "google",
+            "provider": "gemini",
             "config": {
                 "model": config.extraction_model,
                 "api_key": config.gemini_api_key,
@@ -31,7 +46,7 @@ def get_memory_client() -> Memory:
             },
         },
         "embedder": {
-            "provider": "google",
+            "provider": "gemini",
             "config": {
                 "model": config.embedding_model,
                 "api_key": config.gemini_api_key,
@@ -43,7 +58,7 @@ def get_memory_client() -> Memory:
                 "host": config.qdrant_host,
                 "port": config.qdrant_port,
                 "collection_name": config.qdrant_collection,
-                "embedding_model_dims": 768,
+                "embedding_model_dims": 3072,
             },
         },
         "history_db_path": config.sqlite_path,

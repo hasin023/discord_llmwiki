@@ -39,15 +39,16 @@ class HybridSearch:
 
         # FastEmbed BM25 encoder (runs locally, no API call)
         try:
-            from fastembed.sparse import BM25
-            self.bm25_encoder = BM25()
+            from fastembed import SparseTextEmbedding
+            self.bm25_encoder = SparseTextEmbedding(model_name="Qdrant/bm25")
             self._hybrid_available = True
             logger.info("hybrid_search.bm25_available")
-        except ImportError:
+        except (ImportError, Exception) as e:
             self._hybrid_available = False
             logger.warning(
-                "hybrid_search.fastembed_not_installed",
-                msg="pip install fastembed to enable hybrid search"
+                "hybrid_search.fastembed_not_available",
+                msg="BM25 hybrid search unavailable, falling back to dense-only",
+                error=str(e),
             )
 
     async def _embed_query(self, query: str) -> list[float]:
@@ -67,7 +68,7 @@ class HybridSearch:
         """Generate BM25 sparse vector for keyword search."""
         if not self._hybrid_available:
             return None
-        sparse_result = list(self.bm25_encoder.query_embed(query))[0]
+        sparse_result = list(self.bm25_encoder.query_embed([query]))[0]
         return SparseVector(
             indices=sparse_result.indices.tolist(),
             values=sparse_result.values.tolist(),
@@ -77,79 +78,32 @@ class HybridSearch:
                     channel_id: Optional[int] = None,
                     limit: int = 10) -> list[dict]:
         """
-        Hybrid search: BM25 + dense + RRF fusion.
-        Falls back to pure mem0.search() if fastembed unavailable.
+        Search for relevant memories.
+        Uses mem0's built-in semantic search (which manages the Qdrant collection).
+        Direct Qdrant RRF fusion requires named vectors that mem0 doesn't create,
+        so we rely on mem0's search with proper agent_id scoping.
         """
-        if not self._hybrid_available:
-            return await self._fallback_search(question, channel_id, limit)
-
         try:
-            # Dense embedding
-            dense_vector = await self._embed_query(question)
-            # Sparse BM25 encoding (local, free)
-            sparse_vector = self._encode_sparse(question)
+            filter_kwargs = {}
+            if channel_id:
+                filter_kwargs["agent_id"] = f"channel_{channel_id}"
+            else:
+                # mem0 requires at least one of user_id, agent_id, or run_id
+                filter_kwargs["agent_id"] = "global"
 
-            # Qdrant prefetch + RRF
-            from qdrant_client.models import (
-                Prefetch, FusionQuery, Fusion, Query
-            )
-
-            prefetch = []
-            # Dense prefetch
-            prefetch.append(Prefetch(
-                query=dense_vector,
-                using=self.DENSE_VECTORS_NAME,
-                limit=limit * 2,
-            ))
-            # Sparse prefetch
-            if sparse_vector:
-                prefetch.append(Prefetch(
-                    query=sparse_vector,
-                    using=self.SPARSE_VECTORS_NAME,
-                    limit=limit * 2,
-                ))
-
-            results = self.qdrant.query_points(
-                collection_name=self.collection,
-                prefetch=prefetch,
-                query=FusionQuery(fusion=Fusion.RRF),
+            results = await asyncio.to_thread(
+                self.memory.search,
+                question,
                 limit=limit,
-                with_payload=True,
+                **filter_kwargs,
             )
 
-            # Format results to match mem0 output format
-            formatted = []
-            for point in results.points:
-                payload = point.payload or {}
-                formatted.append({
-                    "memory": payload.get("data", payload.get("text", "")),
-                    "score": point.score or 0.0,
-                    "metadata": {
-                        "channel_name": payload.get("channel_name", ""),
-                        "timestamp": payload.get("timestamp", ""),
-                        "author_name": payload.get("author_name", ""),
-                    },
-                })
-
-            logger.info("hybrid_search.success", results=len(formatted))
-            return formatted
+            # mem0.search returns {"results": [...]} or a list directly
+            if isinstance(results, dict):
+                return results.get("results", [])
+            return results if results else []
 
         except Exception as e:
             logger.warning("hybrid_search.error", error=str(e))
-            return await self._fallback_search(question, channel_id, limit)
+            return []
 
-    async def _fallback_search(self, question: str,
-                                channel_id: Optional[int] = None,
-                                limit: int = 10) -> list[dict]:
-        """Fallback: use Mem0's built-in semantic search."""
-        filter_kwargs = {}
-        if channel_id:
-            filter_kwargs["agent_id"] = f"channel_{channel_id}"
-
-        results = await asyncio.to_thread(
-            self.memory.search,
-            question,
-            limit=limit,
-            **filter_kwargs,
-        )
-        return results.get("results", [])

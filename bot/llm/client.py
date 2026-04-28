@@ -68,7 +68,7 @@ class LLMClient:
                 model=model,
                 contents=[types.Content(
                     role="user",
-                    parts=[types.Part.from_text(user_prompt)]
+                    parts=[types.Part(text=user_prompt)]
                 )],
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,

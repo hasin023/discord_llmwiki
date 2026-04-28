@@ -27,75 +27,83 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                   channel: discord.TextChannel = None):
         await interaction.response.defer(thinking=True)
 
-        # 1. Check semantic cache
-        cached = await self.bot.semantic_cache.check(question)
-        if cached:
+        try:
+            # 1. Check semantic cache
+            cached = await self.bot.semantic_cache.check(question)
+            if cached:
+                embed = make_embed(
+                    "💬 Answer (cached)",
+                    cached,
+                    color=discord.Color.green(),
+                    footer="From semantic cache — 0 API calls used",
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+            # 2. Budget check for embedding
+            decision = await self.bot.budget.check(
+                model=self.bot.config_obj.embedding_model,
+                priority="high",
+            )
+            if decision == BudgetDecision.SKIP:
+                await interaction.followup.send(
+                    "⚠️ Embedding budget exhausted for today. Try again tomorrow.",
+                    ephemeral=True,
+                )
+                return
+
+            # 3. Hybrid search
+            channel_id = channel.id if channel else None
+            facts = await self.bot.hybrid_search.query(question, channel_id=channel_id)
+
+            # 4. Wiki search
+            wiki_pages = await self.bot.wiki_reader.find_relevant_pages(question, max_pages=3)
+
+            # 5. Budget check for LLM
+            decision = await self.bot.budget.check(
+                model=self.bot.config_obj.query_model,
+                priority="high",
+            )
+            if decision == BudgetDecision.SKIP:
+                # Still show facts even if LLM is unavailable
+                embed = make_embed(
+                    "📋 Raw Facts (LLM budget depleted)",
+                    format_facts_list(facts),
+                    color=discord.Color.orange(),
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+            # 6. LLM answer
+            mem0_facts = "\n".join(
+                f"- {f.get('memory', '')}" for f in (facts[:8] if facts else [])
+            )
+            wiki_context = "\n".join(
+                p.body[:600] for p in wiki_pages
+            ) if wiki_pages else ""
+
+            answer = await self.bot.llm_client.answer_question(
+                question=question,
+                mem0_facts=mem0_facts,
+                wiki_context=wiki_context,
+            )
+
+            # 7. Store in cache
+            await self.bot.semantic_cache.store(question, answer)
+
             embed = make_embed(
-                "💬 Answer (cached)",
-                cached,
-                color=discord.Color.green(),
-                footer="From semantic cache — 0 API calls used",
+                "💬 Answer",
+                answer,
+                footer=f"Based on {len(facts)} facts + {len(wiki_pages)} wiki pages",
             )
             await interaction.followup.send(embed=embed)
-            return
 
-        # 2. Budget check for embedding
-        decision = await self.bot.budget.check(
-            model=self.bot.config_obj.embedding_model,
-            priority="high",
-        )
-        if decision == BudgetDecision.SKIP:
+        except Exception as e:
+            logger.error("ask.error", error=str(e), question=question)
             await interaction.followup.send(
-                "⚠️ Embedding budget exhausted for today. Try again tomorrow.",
+                f"❌ Something went wrong while processing your question. Please try again later.",
                 ephemeral=True,
             )
-            return
-
-        # 3. Hybrid search
-        channel_id = channel.id if channel else None
-        facts = await self.bot.hybrid_search.query(question, channel_id=channel_id)
-
-        # 4. Wiki search
-        wiki_pages = await self.bot.wiki_reader.find_relevant_pages(question, max_pages=3)
-
-        # 5. Budget check for LLM
-        decision = await self.bot.budget.check(
-            model=self.bot.config_obj.query_model,
-            priority="high",
-        )
-        if decision == BudgetDecision.SKIP:
-            # Still show facts even if LLM is unavailable
-            embed = make_embed(
-                "📋 Raw Facts (LLM budget depleted)",
-                format_facts_list(facts),
-                color=discord.Color.orange(),
-            )
-            await interaction.followup.send(embed=embed)
-            return
-
-        # 6. LLM answer
-        mem0_facts = "\n".join(
-            f"- {f.get('memory', '')}" for f in (facts[:8] if facts else [])
-        )
-        wiki_context = "\n".join(
-            p.body[:600] for p in wiki_pages
-        ) if wiki_pages else ""
-
-        answer = await self.bot.llm_client.answer_question(
-            question=question,
-            mem0_facts=mem0_facts,
-            wiki_context=wiki_context,
-        )
-
-        # 7. Store in cache
-        await self.bot.semantic_cache.store(question, answer)
-
-        embed = make_embed(
-            "💬 Answer",
-            answer,
-            footer=f"Based on {len(facts)} facts + {len(wiki_pages)} wiki pages",
-        )
-        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="whois", description="See what the bot knows about a member")
     @app_commands.describe(member="The member to look up")
