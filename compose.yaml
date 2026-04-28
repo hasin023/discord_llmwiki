@@ -1,0 +1,40 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: llmwiki_qdrant
+    restart: unless-stopped
+    volumes:
+      - ./data/qdrant:/qdrant/storage:z
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readiness"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: llmwiki_bot
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./wiki:/wiki:rw
+      - ./data/sqlite:/data/sqlite:rw
+      - ./data/cm_config:/data/cm_config:rw
+      - ./data/cache:/data/cache:rw
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

@@ -1,0 +1,38 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Data
+data/qdrant/
+data/sqlite/
+data/cm_config/
+data/cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Wiki (generated content — optionally track in git)
+# wiki/entities/
+# wiki/topics/
+# wiki/channels/
+# wiki/timeline/
+# wiki/synthesis/
+# wiki/resources/
+.agent/
