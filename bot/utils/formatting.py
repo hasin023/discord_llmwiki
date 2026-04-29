@@ -50,14 +50,3 @@ def format_facts_list(facts: list[dict], max_facts: int = 8) -> str:
         lines.append(f"• {truncate(memory, 200)} *(score: {score:.2f})*")
     return "\n".join(lines)
 
-
-def format_wiki_pages(pages: list, max_pages: int = 3) -> str:
-    """Format wiki pages for embed display."""
-    if not pages:
-        return "*No relevant wiki pages found.*"
-    lines = []
-    for page in pages[:max_pages]:
-        title = getattr(page, "title", "Untitled")
-        summary = getattr(page, "body", "")[:150]
-        lines.append(f"📄 **{title}**\n{summary}…")
-    return "\n\n".join(lines)

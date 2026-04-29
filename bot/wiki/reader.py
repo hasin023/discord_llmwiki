@@ -1,7 +1,6 @@
 """
 WikiReader — Loads and searches wiki markdown pages.
 """
-import os
 import re
 from pathlib import Path
 from typing import Optional

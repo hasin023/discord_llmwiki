@@ -4,10 +4,7 @@ SemanticResponseCache — Embedding-based deduplication of /ask responses.
 Caches LLM responses for /ask queries and returns them for semantically
 similar questions without making a new LLM call.
 
-Particularly effective for FAQ-style questions in Discord servers where
-many members ask the same things (meeting times, role requirements, etc.)
-
-Expected savings: 20-40% reduction in /ask LLM calls for active servers.
+Uses local sentence-transformers model (same as mem0 embedder) — 0 API calls.
 """
 import asyncio
 import math
@@ -16,8 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from collections import deque
 
-from google import genai
-from google.genai import types
+from sentence_transformers import SentenceTransformer
 
 from utils.logging_setup import get_logger
 
@@ -56,42 +52,47 @@ class SemanticResponseCache:
 
     def __init__(
         self,
-        gemini_client,
-        embedding_model: str = "gemini-embedding-001",
+        embedding_model: str = "BAAI/bge-small-en-v1.5",
         similarity_threshold: float = 0.92,
         max_entries: int = 200,
         ttl_hours: int = 24,
+        **kwargs,  # Accept and ignore extra args (e.g. gemini_client from old config)
     ):
-        self.client = gemini_client
-        self.embedding_model = embedding_model
         self.threshold = similarity_threshold
         self.max_entries = max_entries
         self.ttl = timedelta(hours=ttl_hours)
         self._cache: deque[CacheEntry] = deque(maxlen=max_entries)
 
+        # Load local embedding model (same model mem0 uses, shared cache on disk)
+        try:
+            self._model = SentenceTransformer(embedding_model)
+            logger.info("semantic_cache.model_loaded", model=embedding_model)
+        except Exception as e:
+            self._model = None
+            logger.warning("semantic_cache.model_load_error", error=str(e))
+
+    def _embed(self, text: str) -> list[float]:
+        """Embed text locally using sentence-transformers."""
+        if self._model is None:
+            return []
+        return self._model.encode(text, normalize_embeddings=True).tolist()
+
     async def _embed_query(self, text: str) -> list[float]:
-        """Embed a query using the task_type for retrieval."""
-        result = await asyncio.to_thread(
-            self.client.models.embed_content,
-            model=self.embedding_model,
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=768,
-            ),
-        )
-        return result.embeddings[0].values
+        """Embed a query asynchronously (runs model in thread pool)."""
+        return await asyncio.to_thread(self._embed, text)
 
     async def check(self, question: str) -> Optional[str]:
         """
         Check if a semantically similar question has been answered recently.
         Returns cached answer if found, None otherwise.
         """
-        if not self._cache:
+        if not self._cache or self._model is None:
             return None
 
         now = datetime.now()
         question_embedding = await self._embed_query(question)
+        if not question_embedding:
+            return None
 
         best_score = 0.0
         best_entry: Optional[CacheEntry] = None
@@ -121,6 +122,8 @@ class SemanticResponseCache:
         """Store a question-answer pair in the cache."""
         try:
             embedding = await self._embed_query(question)
+            if not embedding:
+                return
             entry = CacheEntry(
                 question=question,
                 answer=answer,

@@ -1,7 +1,7 @@
 """
 Data models for message events and enriched content.
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from datetime import datetime
 from typing import Optional
 from dataclasses import dataclass, field
@@ -91,9 +91,21 @@ class WikiPage(BaseModel):
     created: Optional[str] = None
     updated: Optional[str] = None
 
+    @field_validator("created", "updated", mode="before")
+    @classmethod
+    def _coerce_date(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        # YAML frontmatter parses dates as datetime.date/datetime objects
+        return str(v)
+
 
 class QueryResult(BaseModel):
     """Result from a /ask query."""
+    model_config = {"protected_namespaces": ()}  # Allow 'model_used' field name
+
     answer: str
     facts_used: int = 0
     wiki_pages_used: int = 0

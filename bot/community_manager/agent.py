@@ -13,8 +13,6 @@ from memory.schemas import MessageEvent
 from community_manager.schemas import CMConfig
 from community_manager.config_store import ConfigStore
 from community_manager.behaviours.faq_responder import FAQResponder
-from community_manager.behaviours.context_injector import ContextInjector
-from community_manager.behaviours.duplicate_detector import DuplicateDetector
 from community_manager.behaviours.moderation_assist import ModerationAssist
 from community_manager.behaviours.onboarding import OnboardingFlow
 from community_manager.behaviours.digest import DigestScheduler
@@ -35,10 +33,13 @@ class CommunityManagerAgent:
         self._prefilter = LocalPreFilter()
 
         # Event-driven behaviours (evaluated per message, priority order)
+        # NOTE: ContextInjector and DuplicateDetector disabled to conserve
+        #       free-tier LLM quota. They trigger mem0.search() + LLM calls
+        #       on every single message. Re-enable on paid tier.
         self.behaviours = [
             FAQResponder(memory_client, wiki_reader, llm_client, config),
-            ContextInjector(memory_client, wiki_reader, llm_client, config),
-            DuplicateDetector(memory_client, llm_client, config),
+            # ContextInjector(memory_client, wiki_reader, llm_client, config),
+            # DuplicateDetector(memory_client, llm_client, config),
             ModerationAssist(llm_client, config),
         ]
 

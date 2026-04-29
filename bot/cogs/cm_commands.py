@@ -14,6 +14,7 @@ from utils.logging_setup import get_logger
 logger = get_logger(__name__)
 
 
+@app_commands.default_permissions(administrator=True)
 class CMGroup(app_commands.Group):
     def __init__(self, config_path: str):
         super().__init__(

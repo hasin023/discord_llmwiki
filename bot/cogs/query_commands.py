@@ -40,14 +40,14 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                 await interaction.followup.send(embed=embed)
                 return
 
-            # 2. Budget check for embedding
+            # 2. Budget check for LLM (embeddings are local now, no budget needed)
             decision = await self.bot.budget.check(
-                model=self.bot.config_obj.embedding_model,
+                model=self.bot.config_obj.query_model,
                 priority="high",
             )
             if decision == BudgetDecision.SKIP:
                 await interaction.followup.send(
-                    "⚠️ Embedding budget exhausted for today. Try again tomorrow.",
+                    "⚠️ LLM budget exhausted. Try again later.",
                     ephemeral=True,
                 )
                 return
@@ -59,22 +59,7 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
             # 4. Wiki search
             wiki_pages = await self.bot.wiki_reader.find_relevant_pages(question, max_pages=3)
 
-            # 5. Budget check for LLM
-            decision = await self.bot.budget.check(
-                model=self.bot.config_obj.query_model,
-                priority="high",
-            )
-            if decision == BudgetDecision.SKIP:
-                # Still show facts even if LLM is unavailable
-                embed = make_embed(
-                    "📋 Raw Facts (LLM budget depleted)",
-                    format_facts_list(facts),
-                    color=discord.Color.orange(),
-                )
-                await interaction.followup.send(embed=embed)
-                return
-
-            # 6. LLM answer
+            # 5. LLM answer
             mem0_facts = "\n".join(
                 f"- {f.get('memory', '')}" for f in (facts[:8] if facts else [])
             )
@@ -88,7 +73,7 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                 wiki_context=wiki_context,
             )
 
-            # 7. Store in cache
+            # 6. Store in cache
             await self.bot.semantic_cache.store(question, answer)
 
             embed = make_embed(
@@ -99,32 +84,78 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
             await interaction.followup.send(embed=embed)
 
         except Exception as e:
-            logger.error("ask.error", error=str(e), question=question)
-            await interaction.followup.send(
-                f"❌ Something went wrong while processing your question. Please try again later.",
-                ephemeral=True,
-            )
+            error_msg = str(e)
+            logger.error("ask.error", error=error_msg, question=question)
+
+            # User-friendly error for rate limits
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                await interaction.followup.send(
+                    "⚠️ API rate limit reached. Please wait a minute and try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ Something went wrong while processing your question. Please try again later.",
+                    ephemeral=True,
+                )
 
     @app_commands.command(name="whois", description="See what the bot knows about a member")
     @app_commands.describe(member="The member to look up")
     async def whois(self, interaction: discord.Interaction, member: discord.Member):
         await interaction.response.defer(thinking=True)
 
-        facts = await asyncio.to_thread(
-            self.bot.memory_client.search,
-            f"What do we know about {member.display_name}?",
-            user_id=str(member.id),
-            limit=10,
-        )
-        results = facts.get("results", []) if isinstance(facts, dict) else facts
+        try:
+            # Search by user_id directly to get all raw memories
+            facts = await asyncio.to_thread(
+                self.bot.memory_client.get_all,
+                user_id=str(member.id),
+            )
+            results = facts.get("results", []) if isinstance(facts, dict) else facts
 
-        embed = make_embed(
-            f"👤 About {member.display_name}",
-            format_facts_list(results, max_facts=10),
-            color=discord.Color.blue(),
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await interaction.followup.send(embed=embed)
+            # Take the 3 most recent
+            recent_results = results[-3:] if results else []
+
+            # Format manually without scores
+            if recent_results:
+                memory_lines = [f"• {res.get('memory', '')}" for res in recent_results]
+                description = "\n".join(memory_lines)
+            else:
+                description = "*No memories available yet.*"
+
+            # Prepend basic Discord info
+            profile_lines = [
+                f"**Username:** {member.name}",
+                f"**Display Name:** {member.display_name}",
+                f"**Joined Server:** {member.joined_at.strftime('%B %d, %Y') if member.joined_at else 'Unknown'}",
+                f"**Account Created:** {member.created_at.strftime('%B %d, %Y')}",
+                f"**Roles:** {', '.join(r.name for r in member.roles[1:]) or 'None'}",
+                "",
+                "**📝 Memory:**",
+                description,
+            ]
+
+            embed = make_embed(
+                f"👤 About {member.display_name}",
+                "\n".join(profile_lines),
+                color=discord.Color.blue(),
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("whois.error", error=error_msg, member=str(member.id))
+
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                await interaction.followup.send(
+                    "⚠️ API rate limit reached. Please wait a minute and try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ Failed to look up member information.",
+                    ephemeral=True,
+                )
 
     @app_commands.command(name="summary", description="Get a summary of recent activity")
     @app_commands.describe(period="Time period: 'day', 'week', or 'month'")
@@ -132,25 +163,41 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                       period: str = "week"):
         await interaction.response.defer(thinking=True)
 
-        wiki_pages = await self.bot.wiki_reader.list_pages(page_type="timeline")
-        if not wiki_pages:
-            await interaction.followup.send("No activity data available yet.")
-            return
+        try:
+            wiki_pages = await self.bot.wiki_reader.list_pages(page_type="timeline")
+            if not wiki_pages:
+                await interaction.followup.send("No activity data available yet.")
+                return
 
-        latest = sorted(wiki_pages, key=lambda p: p.path, reverse=True)[:2]
-        context = "\n\n".join(p.body[:1000] for p in latest)
+            latest = sorted(wiki_pages, key=lambda p: p.path, reverse=True)[:2]
+            context = "\n\n".join(p.body[:1000] for p in latest)
 
-        answer = await self.bot.llm_client.complete(
-            f"Summarise this server activity for the past {period}. "
-            f"Be concise, use bullet points, format for Discord.\n\n{context}",
-        )
+            answer = await self.bot.llm_client.complete(
+                f"Summarise this server activity for the past {period}. "
+                f"Be concise, use bullet points, format for Discord.\n\n{context}",
+            )
 
-        embed = make_embed(
-            f"📊 {period.capitalize()} Summary",
-            answer,
-            color=discord.Color.purple(),
-        )
-        await interaction.followup.send(embed=embed)
+            embed = make_embed(
+                f"📊 {period.capitalize()} Summary",
+                answer,
+                color=discord.Color.purple(),
+            )
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("summary.error", error=error_msg)
+
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                await interaction.followup.send(
+                    "⚠️ API rate limit reached. Please wait a minute and try again.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ Failed to generate summary. Please try again later.",
+                    ephemeral=True,
+                )
 
 
 async def setup(bot):

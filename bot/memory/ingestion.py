@@ -120,8 +120,8 @@ class IngestionWorker:
         self.prefilter = LocalPreFilter()
         self.dedup = ContentHashDedup()
         self.msg_buffer = MessageBuffer(
-            batch_size=config.ingest_batch_size,
-            flush_interval_seconds=config.ingest_flush_interval,
+            batch_size=config.ingest_batch_size if config.ingest_infer_enabled else 1,
+            flush_interval_seconds=config.ingest_flush_interval if config.ingest_infer_enabled else 0,
         )
 
     async def process(self, event: MessageEvent, discord_message) -> None:
@@ -154,48 +154,102 @@ class IngestionWorker:
         if batch is None:
             return  # Not enough messages yet
 
-        # Step 6: Budget check before mem0 LLM call
-        decision = await self.budget.check(
-            model=self.config.extraction_model,
-            tokens_estimate=2000 * len(batch),
-        )
-        if decision == BudgetDecision.SKIP:
-            logger.warning("ingestion.skipped", reason="budget_exhausted", count=len(batch))
-            return
+        # Step 6: Budget check before mem0 LLM call (if infer is enabled)
+        infer = self.config.ingest_infer_enabled
+        if infer:
+            decision = await self.budget.check(
+                model=self.config.extraction_model,
+                tokens_estimate=2000 * len(batch),
+            )
+            if decision == BudgetDecision.SKIP:
+                infer = False
+                logger.warning("ingestion.fallback_raw", reason="budget_exhausted", count=len(batch))
 
         # Step 7: Single batched mem0.add() for all messages in batch
-        await self._mem0_add_batch(batch)
+        await self._mem0_add_batch(batch, infer=infer)
 
         # Step 8: Wiki buffer
         for e in batch:
             self.wiki_buffer.append(e)
 
-    async def _mem0_add_batch(self, batch: list[EnrichedMessageEvent]) -> None:
-        """Send a batch of messages to mem0.add() as a single LLM call."""
-        combined_messages = [
-            {
-                "role": "user",
-                "content": (
-                    f"[{e.author_name} in #{e.channel_name} "
-                    f"at {e.timestamp.strftime('%H:%M')}]: "
-                    f"{e.enriched_content or e.content}"
-                ),
-            }
-            for e in batch
-        ]
+    async def _mem0_add_batch(self, batch: list[EnrichedMessageEvent], infer: bool = True) -> None:
+        """Send a batch of messages to mem0.add(), split by author so each
+        user's memories are stored with their user_id for retrieval.
+        Falls back to infer=False (raw insertion) if LLM limits hit."""
+        from collections import defaultdict
 
-        try:
-            await asyncio.to_thread(
-                self.memory.add,
-                combined_messages,
-                agent_id=f"channel_{batch[0].channel_id}",
-                metadata={
-                    "channel_name": batch[0].channel_name,
-                    "guild_id": str(batch[0].guild_id),
-                    "batch_size": len(batch),
-                    "timestamp": batch[-1].timestamp.isoformat(),
-                },
-            )
-            logger.info("ingestion.mem0_batch", size=len(batch))
-        except Exception as e:
-            logger.error("ingestion.mem0_error", error=str(e))
+        # Group messages by author so each gets their own user_id
+        by_author: dict[int, list[EnrichedMessageEvent]] = defaultdict(list)
+        for e in batch:
+            by_author[e.author_id].append(e)
+
+        for author_id, events in by_author.items():
+            combined_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"[{e.author_name} in #{e.channel_name} "
+                        f"at {e.timestamp.strftime('%H:%M')}]: "
+                        f"{e.enriched_content or e.content}"
+                    ),
+                }
+                for e in events
+            ]
+            metadata = {
+                "channel_name": events[0].channel_name,
+                "guild_id": str(events[0].guild_id),
+                "author_name": events[0].author_name,
+                "batch_size": len(events),
+                "timestamp": events[-1].timestamp.isoformat(),
+            }
+
+            try:
+                await asyncio.to_thread(
+                    self.memory.add,
+                    combined_messages,
+                    user_id=str(author_id),
+                    agent_id=f"channel_{events[0].channel_id}",
+                    infer=infer,
+                    metadata=metadata,
+                )
+                logger.info(
+                    "ingestion.mem0_batch",
+                    size=len(events),
+                    user_id=str(author_id),
+                    author=events[0].author_name,
+                    infer=infer,
+                )
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str and infer:
+                    logger.warning("ingestion.mem0_fallback", reason="429_rate_limit", user_id=str(author_id))
+                    # Fallback: API quota exceeded during infer. Force raw insertion.
+                    try:
+                        await asyncio.to_thread(
+                            self.memory.add,
+                            combined_messages,
+                            user_id=str(author_id),
+                            agent_id=f"channel_{events[0].channel_id}",
+                            infer=False,
+                            metadata=metadata,
+                        )
+                        logger.info(
+                            "ingestion.mem0_batch",
+                            size=len(events),
+                            user_id=str(author_id),
+                            author=events[0].author_name,
+                            infer=False,
+                        )
+                    except Exception as e2:
+                        logger.error(
+                            "ingestion.mem0_error_fallback",
+                            error=str(e2),
+                            user_id=str(author_id),
+                        )
+                else:
+                    logger.error(
+                        "ingestion.mem0_error",
+                        error=error_str,
+                        user_id=str(author_id),
+                    )
+

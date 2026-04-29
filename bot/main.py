@@ -11,13 +11,7 @@ Startup sequence:
 7. IngestionWorker
 8. Load cogs + sync slash commands
 """
-import warnings
 import asyncio
-
-# ── Suppress known third-party warnings (must run before imports) ────
-# warnings.filterwarnings("ignore", message="Field \"model_used\" has conflict with protected namespace")
-# warnings.filterwarnings("ignore", message="All support for the `google.generativeai` package has ended")
-# warnings.filterwarnings("ignore", message="parameter 'timeout' of type 'float' is deprecated")
 
 import discord
 from discord.ext import commands, tasks
@@ -60,9 +54,8 @@ class LLMWikiBot(commands.Bot):
         else:
             self.budget = make_free_tier_budget_controller(config)
 
-        # Semantic response cache
+        # Semantic response cache (uses local embeddings, 0 API calls)
         self.semantic_cache = SemanticResponseCache(
-            gemini_client=self.llm_client.client,
             embedding_model=config.embedding_model,
             similarity_threshold=config.cache_similarity_threshold,
             max_entries=config.cache_max_entries,
@@ -136,10 +129,14 @@ class LLMWikiBot(commands.Bot):
         self.cache_cleanup_task.start()
 
         # Sync slash commands
-        guild = discord.Object(id=config.discord_guild_id)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-        logger.info("bot.commands_synced", guild_id=config.discord_guild_id)
+        if config.discord_guild_id:
+            guild = discord.Object(id=config.discord_guild_id)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info("bot.commands_synced", guild_id=config.discord_guild_id)
+        else:
+            await self.tree.sync()
+            logger.info("bot.commands_synced_globally")
 
     @tasks.loop(hours=24)
     async def wiki_linter_task(self):

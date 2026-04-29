@@ -6,11 +6,14 @@ mem0ai[nlp]==0.1.101       # [nlp] enables BM25 hybrid search inside Mem0
 qdrant-client>=1.12.1
 
 # Hybrid search (BM25 sparse vectors)
-fastembed==0.3.6            # Local BM25 encoder — no API call needed
+# fastembed removed as it was unused and caused slow boot times
 
 # LLM — Google Gemini
 google-genai>=1.0.0
-google-generativeai==0.8.3    # Legacy SDK — pinned for mem0ai 0.1.101 function calling compatibility
+google-generativeai==0.8.3    # Legacy SDK — pinned for mem0ai 0.1.101 LLM provider
+
+# Local embeddings (torch installed separately in Dockerfile for CPU-only)
+sentence-transformers>=2.7.0
 
 # Data validation
 pydantic==2.8.2

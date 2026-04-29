@@ -1,6 +1,6 @@
 """
 Mem0 OSS client configuration.
-Singleton memory client with Gemini LLM + embedding + Qdrant vector store.
+Singleton memory client with Gemini LLM + local HuggingFace embedding + Qdrant vector store.
 """
 from functools import lru_cache
 from mem0 import Memory
@@ -32,8 +32,8 @@ def get_memory_client() -> Memory:
 
     Configuration:
     - LLM: gemini-2.5-flash-lite (free tier) for fact extraction
-    - Embedder: gemini-embedding-001 (stable GA, 100 RPM free)
-    - Vector store: Qdrant with 768-dim embeddings
+    - Embedder: BAAI/bge-small-en-v1.5 (local, 384 dims, 0 API calls)
+    - Vector store: Qdrant with 384-dim embeddings
     - History: SQLite for Mem0 operation logs
     """
     mem0_config = {
@@ -46,10 +46,10 @@ def get_memory_client() -> Memory:
             },
         },
         "embedder": {
-            "provider": "gemini",
+            "provider": "huggingface",
             "config": {
                 "model": config.embedding_model,
-                "api_key": config.gemini_api_key,
+                "model_kwargs": {"device": "cpu"},
             },
         },
         "vector_store": {
@@ -58,7 +58,7 @@ def get_memory_client() -> Memory:
                 "host": config.qdrant_host,
                 "port": config.qdrant_port,
                 "collection_name": config.qdrant_collection,
-                "embedding_model_dims": 3072,
+                "embedding_model_dims": 384,
             },
         },
         "history_db_path": config.sqlite_path,
