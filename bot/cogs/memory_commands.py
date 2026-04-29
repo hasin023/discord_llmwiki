@@ -28,12 +28,11 @@ class MemoryCommandsCog(commands.Cog, name="Memory"):
         async def view(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                # Strictly search only this user's memories
-                facts = await asyncio.to_thread(
-                    self.bot.memory_client.get_all,
-                    user_id=str(interaction.user.id),
+                # Strictly search only this user's memories IN THIS GUILD
+                guild_id = interaction.guild.id if interaction.guild else None
+                results = await self.bot.hybrid_search.get_user_memories(
+                    interaction.user.id, guild_id=guild_id, limit=50,
                 )
-                results = facts.get("results", []) if isinstance(facts, dict) else facts
 
                 if not results:
                     await interaction.followup.send(
@@ -61,6 +60,19 @@ class MemoryCommandsCog(commands.Cog, name="Memory"):
         @app_commands.describe(memory_id="The memory to delete")
         async def forget(interaction: discord.Interaction, memory_id: str):
             try:
+                # Security: Verify the memory belongs to this user IN this guild
+                guild_id = interaction.guild.id if interaction.guild else None
+                user_memories = await self.bot.hybrid_search.get_user_memories(
+                    interaction.user.id, guild_id=guild_id, limit=999,
+                )
+                
+                if not any(str(m.get("id")) == str(memory_id) for m in user_memories):
+                    await interaction.response.send_message(
+                        "❌ Memory not found, or you don't have permission to delete it in this server.",
+                        ephemeral=True,
+                    )
+                    return
+
                 await asyncio.to_thread(
                     self.bot.memory_client.delete, memory_id,
                 )
@@ -76,11 +88,11 @@ class MemoryCommandsCog(commands.Cog, name="Memory"):
         async def forget_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
             """Fetch user's memories dynamically for selection."""
             try:
-                facts = await asyncio.to_thread(
-                    self.bot.memory_client.get_all,
-                    user_id=str(interaction.user.id),
+                # Securely get ONLY memories from THIS guild to delete
+                guild_id = interaction.guild.id if interaction.guild else None
+                results = await self.bot.hybrid_search.get_user_memories(
+                    interaction.user.id, guild_id=guild_id, limit=999,
                 )
-                results = facts.get("results", []) if isinstance(facts, dict) else facts
                 
                 choices = []
                 for res in results:
@@ -109,12 +121,27 @@ class MemoryCommandsCog(commands.Cog, name="Memory"):
         async def forgetall(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                await asyncio.to_thread(
-                    self.bot.memory_client.delete_all,
-                    user_id=str(interaction.user.id),
+                # Security: Fetch ONLY memories from THIS guild to delete
+                guild_id = interaction.guild.id if interaction.guild else None
+                results = await self.bot.hybrid_search.get_user_memories(
+                    interaction.user.id, guild_id=guild_id, limit=999,
                 )
+                
+                if not results:
+                    await interaction.followup.send(
+                        "ℹ️ You don't have any memories in this server to delete.", ephemeral=True,
+                    )
+                    return
+                    
+                deleted_count = 0
+                for res in results:
+                    mem_id = res.get("id")
+                    if mem_id:
+                        await asyncio.to_thread(self.bot.memory_client.delete, mem_id)
+                        deleted_count += 1
+                        
                 await interaction.followup.send(
-                    "✅ All your memories have been deleted.", ephemeral=True,
+                    f"✅ Deleted {deleted_count} memories from this server.", ephemeral=True,
                 )
             except Exception as e:
                 await interaction.followup.send(

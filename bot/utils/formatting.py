@@ -46,7 +46,6 @@ def format_facts_list(facts: list[dict], max_facts: int = 8) -> str:
     lines = []
     for fact in facts[:max_facts]:
         memory = fact.get("memory", "")
-        score = fact.get("score", 0)
-        lines.append(f"• {truncate(memory, 200)} *(score: {score:.2f})*")
+        lines.append(f"• {truncate(memory, 200)}")
     return "\n".join(lines)
 

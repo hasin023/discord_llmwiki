@@ -64,6 +64,12 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
+We can remove all the data and start fresh by running the following commands:
+
+```powershell
+Get-ChildItem -Path .\wiki | Remove-Item -Recurse -Force; Get-ChildItem -Path .\data\qdrant | Remove-Item -Recurse -Force; Get-ChildItem -Path .\data\sqlite | Remove-Item -Recurse -Force; Get-ChildItem -Path .\data\cache | Remove-Item -Recurse -Force; New-Item -ItemType File -Path .\wiki\.gitkeep -Force; New-Item -ItemType File -Path .\data\qdrant\.gitkeep -Force; New-Item -ItemType File -Path .\data\sqlite\.gitkeep -Force; New-Item -ItemType File -Path .\data\cache\.gitkeep -Force
+```
+
 > **Note:** All data directories and the wiki structure are created automatically on first boot — no manual setup needed beyond configuring `.env`.
 
 ### Discord Developer Portal Setup

@@ -33,8 +33,10 @@ class DigestScheduler:
 
         # Gather timeline data
         week_str = datetime.now().strftime("%Y_W%W")
-        timeline_page = await self.wiki_reader.load_page(f"timeline/week_{week_str}.md")
-        recent_resources = await self._get_recent_resources()
+        timeline_page = await self.wiki_reader.load_page(
+            f"timeline/week_{week_str}.md", guild_id=guild.id,
+        )
+        recent_resources = await self._get_recent_resources(guild_id=guild.id)
 
         prompt = (
             f"Write a {period} digest post for a Discord server community manager bot.\n"
@@ -58,8 +60,8 @@ class DigestScheduler:
         await digest_channel.send(embed=embed)
         logger.info("digest.posted", period=period, guild=guild.name)
 
-    async def _get_recent_resources(self) -> str:
-        pages = await self.wiki_reader.list_pages(page_type="resource")
+    async def _get_recent_resources(self, guild_id: int = None) -> str:
+        pages = await self.wiki_reader.list_pages(page_type="resource", guild_id=guild_id)
         if not pages:
             return "No resources shared recently."
         return "\n".join(f"- {p.title}: {p.body[:100]}" for p in pages[:5])

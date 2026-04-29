@@ -3,6 +3,7 @@ Query commands — /ask, /whois, /summary slash commands.
 Uses SemanticResponseCache + HybridSearch + BudgetController.
 """
 import asyncio
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,10 +14,42 @@ from utils.logging_setup import get_logger
 
 logger = get_logger(__name__)
 
+# Pattern to detect @username mentions in a question
+# Matches both @username and plain username references
+MENTION_RE = re.compile(r"@(\w+)", re.IGNORECASE)
+
 
 class QueryCommandsCog(commands.Cog, name="Queries"):
     def __init__(self, bot):
         self.bot = bot
+
+    def _extract_mentioned_members(
+        self, question: str, guild: discord.Guild,
+    ) -> list[discord.Member]:
+        """Detect user mentions in the question text by matching against
+        guild members' display names and usernames."""
+        mentioned = []
+        question_lower = question.lower()
+
+        # Check explicit @mentions
+        for match in MENTION_RE.finditer(question):
+            name = match.group(1).lower()
+            for member in guild.members:
+                if (member.display_name.lower() == name
+                        or member.name.lower() == name):
+                    if member not in mentioned and not member.bot:
+                        mentioned.append(member)
+
+        # Also check plain name references (without @)
+        for member in guild.members:
+            if member.bot:
+                continue
+            if (member.display_name.lower() in question_lower
+                    or member.name.lower() in question_lower):
+                if member not in mentioned:
+                    mentioned.append(member)
+
+        return mentioned
 
     @app_commands.command(name="ask", description="Ask the knowledge base a question")
     @app_commands.describe(
@@ -28,8 +61,11 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
         await interaction.response.defer(thinking=True)
 
         try:
+            # 0. Get guild_id for scoped queries
+            guild_id = interaction.guild.id if interaction.guild else None
+
             # 1. Check semantic cache
-            cached = await self.bot.semantic_cache.check(question)
+            cached = await self.bot.semantic_cache.check(question, guild_id=guild_id)
             if cached:
                 embed = make_embed(
                     "💬 Answer (cached)",
@@ -52,34 +88,91 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                 )
                 return
 
-            # 3. Hybrid search
-            channel_id = channel.id if channel else None
-            facts = await self.bot.hybrid_search.query(question, channel_id=channel_id)
+            # 3. Determine search channel — default to current channel
+            search_channel_id = channel.id if channel else interaction.channel.id
 
-            # 4. Wiki search
-            wiki_pages = await self.bot.wiki_reader.find_relevant_pages(question, max_pages=3)
+            # 4. Hybrid search — channel-scoped semantic search + Qdrant fallback
+            facts = await self.bot.hybrid_search.query(
+                question, channel_id=search_channel_id,
+            )
 
-            # 5. LLM answer
+            # 5. User mention detection — fetch mentioned users' memories
+            user_facts = []
+            mentioned_members = []
+            if interaction.guild:
+                mentioned_members = self._extract_mentioned_members(
+                    question, interaction.guild,
+                )
+                for member in mentioned_members:
+                    member_memories = await self.bot.hybrid_search.get_user_memories(
+                        member.id, guild_id=guild_id, limit=10,
+                    )
+                    user_facts.extend(member_memories)
+                    logger.info(
+                        "ask.user_mention_fetch",
+                        member=member.display_name,
+                        memories=len(member_memories),
+                    )
+
+            # 6. Channel fallback — if semantic search + user lookup returned
+            #    very few results, get recent channel memories for context
+            channel_fallback = []
+            if len(facts) + len(user_facts) < 3:
+                channel_fallback = await self.bot.hybrid_search.get_channel_memories(
+                    search_channel_id, limit=15,
+                )
+                logger.info(
+                    "ask.channel_fallback",
+                    channel_id=search_channel_id,
+                    memories=len(channel_fallback),
+                )
+
+            # 7. Wiki search (guild-scoped)
+            wiki_pages = await self.bot.wiki_reader.find_relevant_pages(
+                question, max_pages=3, guild_id=guild_id,
+            )
+
+            # 8. Combine all memory sources — deduplicate by memory text
+            all_facts = []
+            seen_texts = set()
+
+            for fact_list in [facts, user_facts, channel_fallback]:
+                for f in fact_list:
+                    text = f.get("memory", "")
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
+                        all_facts.append(f)
+
+            # 9. Build context for LLM
             mem0_facts = "\n".join(
-                f"- {f.get('memory', '')}" for f in (facts[:8] if facts else [])
+                f"- {f.get('memory', '')}" for f in all_facts[:15]
             )
             wiki_context = "\n".join(
                 p.body[:600] for p in wiki_pages
             ) if wiki_pages else ""
 
+            # 10. LLM answer
             answer = await self.bot.llm_client.answer_question(
                 question=question,
                 mem0_facts=mem0_facts,
                 wiki_context=wiki_context,
             )
 
-            # 6. Store in cache
-            await self.bot.semantic_cache.store(question, answer)
+            # 11. Store in cache
+            await self.bot.semantic_cache.store(question, answer, guild_id=guild_id)
+
+            # 12. Build response
+            source_info = (
+                f"Based on {len(all_facts)} facts + {len(wiki_pages)} wiki pages"
+            )
+            if mentioned_members:
+                names = ", ".join(m.display_name for m in mentioned_members)
+                source_info += f" | Fetched memories for: {names}"
 
             embed = make_embed(
                 "💬 Answer",
                 answer,
-                footer=f"Based on {len(facts)} facts + {len(wiki_pages)} wiki pages",
+                footer=source_info,
             )
             await interaction.followup.send(embed=embed)
 
@@ -105,15 +198,13 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
         await interaction.response.defer(thinking=True)
 
         try:
-            # Search by user_id directly to get all raw memories
-            facts = await asyncio.to_thread(
-                self.bot.memory_client.get_all,
-                user_id=str(member.id),
+            # Search by user_id and guild_id to get raw memories securely
+            guild_id = interaction.guild.id if interaction.guild else None
+            recent_results = await self.bot.hybrid_search.get_user_memories(
+                member.id, guild_id=guild_id, limit=3,
             )
-            results = facts.get("results", []) if isinstance(facts, dict) else facts
 
-            # Take the 3 most recent
-            recent_results = results[-3:] if results else []
+
 
             # Format manually without scores
             if recent_results:
@@ -158,27 +249,43 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                 )
 
     @app_commands.command(name="summary", description="Get a summary of recent activity")
-    @app_commands.describe(period="Time period: 'day', 'week', or 'month'")
+    @app_commands.describe(period="Time period to summarize")
+    @app_commands.choices(period=[
+        app_commands.Choice(name="Last Day", value="last day"),
+        app_commands.Choice(name="Last 3 Days", value="last 3 days"),
+        app_commands.Choice(name="This Week", value="this week"),
+        app_commands.Choice(name="Last 2 Weeks", value="last 2 weeks"),
+    ])
     async def summary(self, interaction: discord.Interaction,
-                      period: str = "week"):
+                      period: str = "this week"):
         await interaction.response.defer(thinking=True)
 
         try:
-            wiki_pages = await self.bot.wiki_reader.list_pages(page_type="timeline")
+            guild_id = interaction.guild.id if interaction.guild else None
+            wiki_pages = await self.bot.wiki_reader.list_pages(
+                page_type="timeline", guild_id=guild_id,
+            )
             if not wiki_pages:
                 await interaction.followup.send("No activity data available yet.")
                 return
 
+            # Take the most recent 2 timeline pages, passing the full content
+            # so the LLM has all context to filter by date
             latest = sorted(wiki_pages, key=lambda p: p.path, reverse=True)[:2]
-            context = "\n\n".join(p.body[:1000] for p in latest)
+            context = "\n\n".join(p.body for p in latest)
+
+            from datetime import datetime
+            now_str = datetime.now().strftime("%Y-%m-%d")
 
             answer = await self.bot.llm_client.complete(
-                f"Summarise this server activity for the past {period}. "
+                f"Today is {now_str}. Summarise this server activity for the past {period}. "
+                f"Crucially, keep statements associated with the users who made them (e.g., '@user likes X'). "
+                f"Do not assume statements from different users are contradictions. "
                 f"Be concise, use bullet points, format for Discord.\n\n{context}",
             )
 
             embed = make_embed(
-                f"📊 {period.capitalize()} Summary",
+                f"📊 {period.title()} Summary",
                 answer,
                 color=discord.Color.purple(),
             )

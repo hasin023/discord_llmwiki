@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# Bootstrap the wiki directory structure
+# Bootstrap the wiki root directory structure.
+# Guild-specific subdirectories are created at runtime by the bot.
 WIKI_DIR="${1:-./wiki}"
 
-mkdir -p "$WIKI_DIR"/{entities,topics,channels,timeline,synthesis,resources}
-touch "$WIKI_DIR"/{entities,topics,channels,timeline,synthesis,resources}/.gitkeep
+mkdir -p "$WIKI_DIR"
 
 cat > "$WIKI_DIR/WIKI.md" << 'EOF'
 # LLMWiki Schema
 
 ## Purpose
 This wiki is maintained by the LLMWiki bot. It serves as the compiled knowledge base
-for a Discord server, synthesising conversations into structured, interlinked pages.
+for Discord servers, synthesising conversations into structured, interlinked pages.
 
 ## Directory Structure
-- entities/ — One page per notable person, tool, project, or concept
-- topics/ — One page per recurring discussion topic
-- channels/ — One page per active channel (auto-generated summaries)
-- timeline/ — Weekly activity logs
-- synthesis/ — Cross-cutting analysis and insight pages
-- resources/ — One page per significant external resource shared in the server
+Wiki pages are organised by guild (server) ID:
+- {guild_id}/entities/ — One page per notable person, tool, project, or concept
+- {guild_id}/topics/ — One page per recurring discussion topic
+- {guild_id}/channels/ — One page per active channel (auto-generated summaries)
+- {guild_id}/timeline/ — Weekly activity logs
+- {guild_id}/synthesis/ — Cross-cutting analysis and insight pages
+- {guild_id}/resources/ — One page per significant external resource shared in the server
 
 ## Page Format
 All pages use YAML frontmatter with at minimum: title, type, created, updated.
@@ -48,4 +49,4 @@ cat > "$WIKI_DIR/index.md" << 'EOF'
 |------|------|---------|---------|---------| 
 EOF
 
-echo "✅ Wiki structure initialized at $WIKI_DIR"
+echo "✅ Wiki root initialized at $WIKI_DIR"

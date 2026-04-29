@@ -46,7 +46,7 @@ class CommunityManagerAgent:
         # Standalone behaviours
         self.onboarding = OnboardingFlow(llm_client, wiki_reader, config)
         self.digest = DigestScheduler(memory_client, wiki_reader, llm_client, config)
-        self.recognition = MemberRecognition(memory_client, llm_client, config)
+        self.recognition = MemberRecognition(bot.hybrid_search, llm_client, config)
 
     def _get_config(self, guild_id: int) -> CMConfig:
         return self.config_store.load(guild_id)

@@ -9,8 +9,8 @@ logger = get_logger(__name__)
 class MemberRecognition:
     """Tracks contributions and posts weekly recognition."""
 
-    def __init__(self, memory_client, llm_client, config):
-        self.memory = memory_client
+    def __init__(self, hybrid_search, llm_client, config):
+        self.hybrid_search = hybrid_search
         self.llm = llm_client
         self.config = config
 
@@ -29,8 +29,8 @@ class MemberRecognition:
         if not channel:
             return
 
-        # Query Mem0 for recent activity metadata
-        top_contributors = await self._get_top_contributors(days=7, top_n=3)
+        # Query Qdrant for recent activity metadata scoped to this guild
+        top_contributors = await self._get_top_contributors(guild.id, days=7, top_n=3)
         if not top_contributors:
             return
 
@@ -50,24 +50,61 @@ class MemberRecognition:
         )
         logger.info("recognition.posted", guild=guild.name)
 
-    async def _get_top_contributors(self, days: int = 7,
+    async def _get_top_contributors(self, guild_id: int, days: int = 7,
                                      top_n: int = 3) -> list[tuple]:
-        """Get top contributors from Mem0 history. Returns [(user_id, count)]."""
-        # This queries the SQLite history DB for message counts
-        # In practice, this would query mem0's internal history
+        """Get top contributors by counting memory points in Qdrant for the guild."""
         try:
-            import sqlite3
-            conn = sqlite3.connect(self.config.sqlite_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT user_id, COUNT(*) as cnt FROM history "
-                "WHERE created_at > datetime('now', ?) "
-                "GROUP BY user_id ORDER BY cnt DESC LIMIT ?",
-                (f"-{days} days", top_n),
-            )
-            results = cursor.fetchall()
-            conn.close()
-            return results
+            from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+            from collections import Counter
+            from datetime import datetime, timedelta
+            import asyncio
+            
+            cutoff = datetime.now() - timedelta(days=days)
+            
+            # Scroll through the guild's memory points
+            qdrant = self.hybrid_search._qdrant
+            collection = self.hybrid_search.collection
+            
+            def do_scroll():
+                return qdrant.scroll(
+                    collection_name=collection,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="metadata.guild_id",
+                                match=MatchValue(value=str(guild_id)),
+                            )
+                        ]
+                    ),
+                    limit=10000,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                
+            records, _ = await asyncio.to_thread(do_scroll)
+            
+            counts = Counter()
+            for r in records:
+                payload = r.payload or {}
+                user_id = payload.get("user_id")
+                if not user_id:
+                    continue
+                    
+                meta = payload.get("metadata", {})
+                timestamp_str = meta.get("timestamp")
+                if timestamp_str:
+                    try:
+                        ts = datetime.fromisoformat(timestamp_str)
+                        if ts.tzinfo is not None:
+                            ts = ts.replace(tzinfo=None)
+                        if ts < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                
+                counts[user_id] += 1
+                
+            return counts.most_common(top_n)
         except Exception as e:
             logger.warning("recognition.query_error", error=str(e))
             return []

@@ -1,6 +1,9 @@
 """
 WikiWriter — Batch-processes ingested messages into wiki pages.
 Creates/updates entity, topic, channel, timeline, and resource pages.
+
+Guild-isolated: all wiki files are written under /wiki/{guild_id}/ so
+multiple Discord servers sharing the same bot instance stay separated.
 """
 import asyncio
 from datetime import datetime
@@ -17,16 +20,27 @@ logger = get_logger(__name__)
 
 
 class WikiBuffer:
-    """Collects enriched events for periodic wiki writing."""
+    """Collects enriched events for periodic wiki writing.
 
-    def __init__(self, batch_size: int = 20, timeout_seconds: int = 600):
+    Flush triggers:
+    - Immediately when batch_size messages accumulate (event-driven)
+    - After timeout_seconds if ANY new messages are waiting
+
+    Will NOT re-flush on timer ticks if no new content has arrived.
+    """
+
+    def __init__(self, batch_size: int = 10, timeout_seconds: int = 180):
         self.batch_size = batch_size
         self.timeout = timeout_seconds
         self._buffer: list[EnrichedMessageEvent] = []
         self._last_flush = datetime.now()
+        self._batch_ready = asyncio.Event()
 
     def append(self, event) -> None:
         self._buffer.append(event)
+        # Signal immediately when batch is full
+        if len(self._buffer) >= self.batch_size:
+            self._batch_ready.set()
 
     def should_flush(self) -> bool:
         if not self._buffer:
@@ -38,6 +52,7 @@ class WikiBuffer:
         batch = list(self._buffer)
         self._buffer.clear()
         self._last_flush = datetime.now()
+        self._batch_ready.clear()
         return batch
 
     @property
@@ -46,27 +61,49 @@ class WikiBuffer:
 
 
 class WikiWriter:
-    """Processes batches of messages into wiki markdown pages."""
+    """Processes batches of messages into wiki markdown pages.
+
+    Wiki files are stored under {wiki_root}/{guild_id}/ for guild isolation.
+    """
 
     def __init__(self, llm_client, wiki_reader, budget: BudgetController, config):
         self.llm = llm_client
         self.reader = wiki_reader
         self.budget = budget
         self.config = config
-        self.wiki_path = Path(config.wiki_path)
+        self.wiki_root = Path(config.wiki_path)
         self.buffer = WikiBuffer(
             batch_size=config.wiki_batch_size,
             timeout_seconds=config.wiki_batch_timeout_seconds,
         )
+
+    def _guild_wiki_path(self, guild_id: int | str) -> Path:
+        """Return the guild-scoped wiki directory, creating it if needed."""
+        path = self.wiki_root / str(guild_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def start_background_task(self, loop) -> None:
         """Start the periodic wiki writing task."""
         loop.create_task(self._writer_loop())
 
     async def _writer_loop(self) -> None:
-        """Background loop that flushes the wiki buffer periodically."""
+        """Background loop that flushes the wiki buffer when ready.
+
+        Wakes up immediately when batch_size is reached (via asyncio.Event),
+        or checks every 30s for timeout-based flushing.
+        Does NOT trigger if the buffer is empty (no wasted LLM calls).
+        """
         while True:
-            await asyncio.sleep(60)  # Check every minute
+            try:
+                # Wait for batch-ready signal OR check every 30s
+                await asyncio.wait_for(
+                    self.buffer._batch_ready.wait(), timeout=30,
+                )
+                self.buffer._batch_ready.clear()
+            except asyncio.TimeoutError:
+                pass
+
             if self.buffer.should_flush():
                 batch = self.buffer.flush()
                 if batch:
@@ -90,6 +127,10 @@ class WikiWriter:
         logger.info("wiki.processing_batch", size=len(batch))
 
         try:
+            # Determine guild-scoped wiki path from the first event
+            guild_id = batch[0].guild_id
+            wiki_path = self._guild_wiki_path(guild_id)
+
             # Step 1: Group messages by channel
             by_channel: dict[str, list] = {}
             for event in batch:
@@ -97,19 +138,19 @@ class WikiWriter:
 
             # Step 2: Update channel pages
             for channel_name, events in by_channel.items():
-                await self._update_channel_page(channel_name, events)
+                await self._update_channel_page(wiki_path, channel_name, events)
 
             # Step 3: Update timeline page
-            await self._update_timeline(batch)
+            await self._update_timeline(wiki_path, batch)
 
             # Step 4: Process resources (URLs/media)
             for event in batch:
                 if event.media_items:
                     for item in event.media_items:
-                        await self._update_resource_page(item, event)
+                        await self._update_resource_page(wiki_path, item, event)
 
             # Step 5: Extract and update entity/topic pages
-            await self._extract_entities_and_topics(batch)
+            await self._extract_entities_and_topics(wiki_path, batch)
 
             # Step 6: Log the operation
             await self._log_operation(len(batch))
@@ -117,10 +158,10 @@ class WikiWriter:
         except Exception as e:
             logger.error("wiki.batch_error", error=str(e))
 
-    async def _update_channel_page(self, channel_name: str,
+    async def _update_channel_page(self, wiki_path: Path, channel_name: str,
                                     events: list[EnrichedMessageEvent]) -> None:
         """Create or update a channel summary page."""
-        page_path = self.wiki_path / "channels" / f"channel_{channel_name}.md"
+        page_path = wiki_path / "channels" / f"channel_{channel_name}.md"
         page_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Build conversation context
@@ -138,14 +179,15 @@ class WikiWriter:
                 f"Update this channel wiki page with new conversation data.\n\n"
                 f"Existing page:\n{existing[:2000]}\n\n"
                 f"New conversations:\n{conversation}\n\n"
-                f"Return the complete updated page. Keep frontmatter. "
-                f"Add new discussion points. Update the 'updated' date to {now}."
+                f"Return the complete updated page in plain markdown (no code fences). "
+                f"Keep frontmatter. Add new discussion points. "
+                f"Update the 'updated' date to {now}."
             )
         else:
             prompt = (
                 f"Create a wiki page for Discord channel #{channel_name}.\n\n"
                 f"Recent conversations:\n{conversation}\n\n"
-                f"Format as markdown with YAML frontmatter:\n"
+                f"Format as plain markdown (no code fences) with YAML frontmatter:\n"
                 f"---\ntitle: \"Channel: #{channel_name}\"\n"
                 f"type: channel\ncreated: {now}\nupdated: {now}\n---\n\n"
                 f"Include: purpose, key topics, active members."
@@ -153,19 +195,22 @@ class WikiWriter:
 
         try:
             content = await self.llm.complete(prompt, model=self.config.wiki_writer_model)
+            # Strip code fences if the LLM wraps the output
+            content = self._strip_code_fences(content)
             page_path.write_text(content, encoding="utf-8")
             logger.info("wiki.channel_updated", channel=channel_name)
         except Exception as e:
             logger.error("wiki.channel_error", channel=channel_name, error=str(e))
 
-    async def _update_timeline(self, batch: list[EnrichedMessageEvent]) -> None:
+    async def _update_timeline(self, wiki_path: Path,
+                                batch: list[EnrichedMessageEvent]) -> None:
         """Update the weekly timeline page."""
         week_str = datetime.now().strftime("%Y_W%W")
-        page_path = self.wiki_path / "timeline" / f"week_{week_str}.md"
+        page_path = wiki_path / "timeline" / f"week_{week_str}.md"
         page_path.parent.mkdir(parents=True, exist_ok=True)
 
         entries = "\n".join(
-            f"- {e.timestamp.strftime('%Y-%m-%d %H:%M')} #{e.channel_name}: "
+            f"- {e.timestamp.strftime('%Y-%m-%d %H:%M')} #{e.channel_name} [@{e.author_name}]: "
             f"{(e.enriched_content or e.content)[:100]}"
             for e in batch[:20]
         )
@@ -183,7 +228,7 @@ class WikiWriter:
 
         page_path.write_text(new_content, encoding="utf-8")
 
-    async def _update_resource_page(self, media_item: dict,
+    async def _update_resource_page(self, wiki_path: Path, media_item: dict,
                                      event: EnrichedMessageEvent) -> None:
         """Create or update a resource page for a shared URL."""
         url = media_item.get("url", "")
@@ -194,7 +239,7 @@ class WikiWriter:
         import hashlib
         slug = hashlib.md5(url.encode()).hexdigest()[:12]
         filename = f"{media_type}_{slug}.md"
-        page_path = self.wiki_path / "resources" / filename
+        page_path = wiki_path / "resources" / filename
         page_path.parent.mkdir(parents=True, exist_ok=True)
 
         now = datetime.now().strftime("%Y-%m-%d")
@@ -226,7 +271,7 @@ class WikiWriter:
             page_path.write_text(content, encoding="utf-8")
             logger.info("wiki.resource_created", url=url[:60])
 
-    async def _extract_entities_and_topics(self,
+    async def _extract_entities_and_topics(self, wiki_path: Path,
                                             batch: list[EnrichedMessageEvent]) -> None:
         """Use LLM to extract entities and topics from a batch."""
         decision = await self.budget.check(
@@ -265,7 +310,7 @@ class WikiWriter:
             for entity in data.get("entities", []):
                 name = entity["name"].lower().replace(" ", "_")
                 etype = entity.get("type", "unknown")
-                path = self.wiki_path / "entities" / f"{etype}_{name}.md"
+                path = wiki_path / "entities" / f"{etype}_{name}.md"
                 if not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     content = (
@@ -279,7 +324,7 @@ class WikiWriter:
 
             for topic in data.get("topics", []):
                 name = topic["name"].lower().replace(" ", "_")
-                path = self.wiki_path / "topics" / f"topic_{name}.md"
+                path = wiki_path / "topics" / f"topic_{name}.md"
                 if not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     content = (
@@ -293,9 +338,23 @@ class WikiWriter:
         except Exception as e:
             logger.warning("wiki.extract_error", error=str(e))
 
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        """Remove markdown code fences that LLMs sometimes wrap output in."""
+        text = text.strip()
+        if text.startswith("```"):
+            # Remove opening fence (e.g. ```markdown)
+            first_newline = text.find("\n")
+            if first_newline >= 0:
+                text = text[first_newline + 1:]
+            # Remove closing fence
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3].rstrip()
+        return text
+
     async def _log_operation(self, count: int) -> None:
         """Append to wiki/log.md."""
-        log_path = self.wiki_path / "log.md"
+        log_path = self.wiki_root / "log.md"
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"\n- [{now}] Processed batch of {count} messages\n"
         try:

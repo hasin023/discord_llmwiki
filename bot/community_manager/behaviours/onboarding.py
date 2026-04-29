@@ -12,8 +12,8 @@ class OnboardingFlow:
         self.wiki_reader = wiki_reader
         self.config = config
 
-    async def _get_channel_summaries(self) -> str:
-        pages = await self.wiki_reader.list_pages(page_type="channel")
+    async def _get_channel_summaries(self, guild_id: int = None) -> str:
+        pages = await self.wiki_reader.list_pages(page_type="channel", guild_id=guild_id)
         if not pages:
             return "No channel summaries available yet."
         return "\n".join(
@@ -21,7 +21,7 @@ class OnboardingFlow:
         )
 
     async def welcome(self, member: discord.Member, cm_config) -> None:
-        channel_summaries = await self._get_channel_summaries()
+        channel_summaries = await self._get_channel_summaries(guild_id=member.guild.id)
 
         prompt = (
             f"You are a friendly community manager for a Discord server.\n"

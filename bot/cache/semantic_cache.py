@@ -25,6 +25,7 @@ class CacheEntry:
     question: str
     answer: str
     embedding: list[float]
+    guild_id: Optional[str]
     created_at: datetime
     hit_count: int = 0
 
@@ -81,7 +82,7 @@ class SemanticResponseCache:
         """Embed a query asynchronously (runs model in thread pool)."""
         return await asyncio.to_thread(self._embed, text)
 
-    async def check(self, question: str) -> Optional[str]:
+    async def check(self, question: str, guild_id: int | str = None) -> Optional[str]:
         """
         Check if a semantically similar question has been answered recently.
         Returns cached answer if found, None otherwise.
@@ -101,6 +102,9 @@ class SemanticResponseCache:
             # Skip expired entries
             if now - entry.created_at > self.ttl:
                 continue
+            # Security: enforce guild isolation
+            if guild_id and str(entry.guild_id) != str(guild_id):
+                continue
             score = cosine_similarity(question_embedding, entry.embedding)
             if score > best_score:
                 best_score = score
@@ -118,8 +122,8 @@ class SemanticResponseCache:
 
         return None
 
-    async def store(self, question: str, answer: str) -> None:
-        """Store a question-answer pair in the cache."""
+    async def store(self, question: str, answer: str, guild_id: int | str = None) -> None:
+        """Store a question-answer pair in the cache with guild context."""
         try:
             embedding = await self._embed_query(question)
             if not embedding:
@@ -128,6 +132,7 @@ class SemanticResponseCache:
                 question=question,
                 answer=answer,
                 embedding=embedding,
+                guild_id=str(guild_id) if guild_id else None,
                 created_at=datetime.now(),
             )
             self._cache.append(entry)

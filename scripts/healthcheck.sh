@@ -24,9 +24,10 @@ fi
 
 # Check wiki directory
 echo -n "Wiki directory: "
-if [ -d "./wiki" ] && [ -f "./wiki/WIKI.md" ]; then
+if [ -d "./wiki" ]; then
     PAGE_COUNT=$(find ./wiki -name "*.md" | wc -l)
-    echo "✅ $PAGE_COUNT pages"
+    GUILD_COUNT=$(find ./wiki -mindepth 1 -maxdepth 1 -type d | wc -l)
+    echo "✅ $PAGE_COUNT pages across $GUILD_COUNT guild(s)"
 else
     echo "⚠️ Not initialized (run scripts/bootstrap_wiki.sh)"
 fi

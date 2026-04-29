@@ -62,7 +62,8 @@ class WikiCommandsCog(commands.Cog, name="Wiki"):
         # Register commands on the group
         @self.wiki_group.command(name="status", description="Show wiki page counts and health")
         async def status(interaction: discord.Interaction):
-            counts = await self.bot.wiki_reader.get_page_count()
+            guild_id = interaction.guild.id if interaction.guild else None
+            counts = await self.bot.wiki_reader.get_page_count(guild_id=guild_id)
             total = sum(counts.values())
             lines = [f"**{k}**: {v} pages" for k, v in sorted(counts.items())]
             embed = make_embed(
@@ -76,7 +77,8 @@ class WikiCommandsCog(commands.Cog, name="Wiki"):
         @app_commands.describe(query="Search term")
         async def search(interaction: discord.Interaction, query: str):
             await interaction.response.defer(thinking=True)
-            pages = await self.bot.wiki_reader.search_index(query, max_results=5)
+            guild_id = interaction.guild.id if interaction.guild else None
+            pages = await self.bot.wiki_reader.search_index(query, max_results=5, guild_id=guild_id)
             if not pages:
                 await interaction.followup.send(
                     embed=make_embed(

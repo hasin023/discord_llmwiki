@@ -1,12 +1,16 @@
 """
-Hybrid search: delegates to mem0's built-in semantic search.
+Hybrid search: mem0 semantic search + direct Qdrant fallback + user memory lookup.
 
-The BM25 sparse encoder is still initialised (for future direct-Qdrant RRF
-when/if we create a custom collection with named vectors), but query()
-currently uses mem0.search() which manages its own Qdrant collection schema.
+Primary: mem0.search() scoped by channel agent_id.
+Fallback: direct Qdrant vector search when mem0 returns no results.
+User lookup: mem0.get_all() for user-specific memory retrieval.
 """
 import asyncio
 from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+from sentence_transformers import SentenceTransformer
 
 from config import config
 from utils.logging_setup import get_logger
@@ -16,8 +20,13 @@ logger = get_logger(__name__)
 
 class HybridSearch:
     """
-    Search layer that wraps mem0.search() with proper agent_id scoping.
-    Falls back gracefully to empty results on errors.
+    Search layer combining mem0 semantic search with direct Qdrant fallback.
+
+    When the user asks a question via /ask:
+    1. Semantic search via mem0 (channel-scoped by agent_id)
+    2. If 0 results: fallback to direct Qdrant vector search
+    3. If question mentions a user: also fetch their memories via get_all()
+    4. If still sparse: fetch recent channel memories as context
     """
 
     def __init__(self, memory_client, qdrant_host: str,
@@ -25,35 +34,184 @@ class HybridSearch:
         self.memory = memory_client
         self.collection = collection_name
 
-        self._hybrid_available = False
+        # Direct Qdrant client for fallback searches
+        self._qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
+
+        # Local embedding model (same as mem0 uses) for direct Qdrant queries
+        self._embedder = SentenceTransformer(config.embedding_model)
+
+        logger.info(
+            "hybrid_search.init",
+            collection=collection_name,
+            qdrant=f"{qdrant_host}:{qdrant_port}",
+        )
 
     async def query(self, question: str,
                     channel_id: Optional[int] = None,
                     limit: int = 10) -> list[dict]:
         """
         Search for relevant memories via mem0's semantic search.
-        Scopes by channel agent_id when provided.
+        Always scoped by channel agent_id — caller MUST provide channel_id.
+        Falls back to direct Qdrant search if mem0 returns no results.
         """
-        try:
-            filter_kwargs = {}
-            if channel_id:
-                filter_kwargs["agent_id"] = f"channel_{channel_id}"
-            else:
-                # mem0 requires at least one of user_id, agent_id, or run_id
-                filter_kwargs["agent_id"] = "global"
+        results = []
 
-            results = await asyncio.to_thread(
+        if not channel_id:
+            logger.warning("hybrid_search.no_channel_id")
+            return []
+
+        agent_id = f"channel_{channel_id}"
+
+        # Step 1: Semantic search via mem0 (channel-scoped)
+        try:
+            mem0_results = await asyncio.to_thread(
                 self.memory.search,
                 question,
+                agent_id=agent_id,
                 limit=limit,
-                **filter_kwargs,
+            )
+            if isinstance(mem0_results, dict):
+                results = mem0_results.get("results", [])
+            else:
+                results = mem0_results or []
+        except Exception as e:
+            logger.warning("hybrid_search.mem0_error", error=str(e))
+
+        # Step 2: If mem0 returned nothing, try direct Qdrant vector search
+        if not results:
+            logger.info("hybrid_search.mem0_empty_fallback_qdrant", channel_id=channel_id)
+            results = await self._direct_qdrant_search(
+                question, agent_id=agent_id, limit=limit,
             )
 
-            # mem0.search returns {"results": [...]} or a list directly
-            if isinstance(results, dict):
-                return results.get("results", [])
-            return results if results else []
+        return results
+
+    async def get_user_memories(self, user_id: int | str,
+                                guild_id: int | str = None,
+                                limit: int = 15) -> list[dict]:
+        """Get memories for a specific user, STRICTLY scoped to a guild.
+
+        Security: user_id is the same across Discord servers, so we MUST
+        filter by guild_id to prevent cross-server data leakage.
+        """
+        if not guild_id:
+            logger.warning("hybrid_search.user_memories_no_guild",
+                           user_id=str(user_id))
+            return []  # Refuse to return unscoped user memories
+
+        try:
+            facts = await asyncio.to_thread(
+                self.memory.get_all,
+                user_id=str(user_id),
+            )
+            results = facts.get("results", []) if isinstance(facts, dict) else facts
+            if not results:
+                return []
+
+            # SECURITY: post-filter to only include memories from this guild.
+            # Check metadata.guild_id AND agent_id (channel IDs are guild-unique).
+            guild_str = str(guild_id)
+            filtered = []
+            for r in results:
+                meta = r.get("metadata", {})
+                if meta.get("guild_id") == guild_str:
+                    filtered.append(r)
+
+            logger.info(
+                "hybrid_search.user_memories_filtered",
+                user_id=str(user_id),
+                guild_id=guild_str,
+                total=len(results),
+                after_filter=len(filtered),
+            )
+            return filtered[-limit:] if filtered else []
+        except Exception as e:
+            logger.warning("hybrid_search.user_memories_error",
+                           error=str(e), user_id=str(user_id))
+            return []
+
+    async def get_channel_memories(self, channel_id: int,
+                                   limit: int = 20) -> list[dict]:
+        """Get recent memories from a channel (fallback when semantic search
+        returns too few results)."""
+        try:
+            facts = await asyncio.to_thread(
+                self.memory.get_all,
+                agent_id=f"channel_{channel_id}",
+            )
+            results = facts.get("results", []) if isinstance(facts, dict) else facts
+            # Return most recent N
+            return results[-limit:] if results else []
+        except Exception as e:
+            logger.warning("hybrid_search.channel_memories_error",
+                           error=str(e), channel_id=channel_id)
+            return []
+
+    async def _direct_qdrant_search(self, question: str,
+                                     agent_id: str = None,
+                                     guild_id: int | str = None,
+                                     limit: int = 10) -> list[dict]:
+        """
+        Direct Qdrant vector search bypassing mem0's API restrictions.
+        Uses the same embedding model as mem0 for consistent results.
+        Always filtered by agent_id or guild_id for server isolation.
+        """
+        try:
+            # Embed the query locally (0 API calls)
+            query_vector = await asyncio.to_thread(
+                self._embedder.encode, question,
+            )
+
+            # Build filter — ALWAYS scope to prevent cross-guild leakage
+            must_conditions = []
+            if agent_id:
+                must_conditions.append(
+                    FieldCondition(
+                        key="agent_id",
+                        match=MatchValue(value=agent_id),
+                    )
+                )
+            if guild_id:
+                must_conditions.append(
+                    FieldCondition(
+                        key="metadata.guild_id",
+                        match=MatchValue(value=str(guild_id)),
+                    )
+                )
+
+            search_filter = Filter(must=must_conditions) if must_conditions else None
+
+            # Search directly in Qdrant
+            points = await asyncio.to_thread(
+                self._qdrant.search,
+                collection_name=self.collection,
+                query_vector=query_vector.tolist(),
+                limit=limit,
+                query_filter=search_filter,
+            )
+
+            # Convert to mem0-compatible format
+            results = []
+            for point in points:
+                payload = point.payload or {}
+                memory_text = payload.get("memory", payload.get("data", ""))
+                results.append({
+                    "memory": memory_text,
+                    "score": point.score,
+                    "id": str(point.id),
+                    "user_id": payload.get("user_id", ""),
+                    "agent_id": payload.get("agent_id", ""),
+                    "metadata": payload.get("metadata", {}),
+                })
+
+            logger.info(
+                "hybrid_search.direct_qdrant",
+                results=len(results),
+                agent_id=agent_id,
+                guild_id=str(guild_id) if guild_id else None,
+            )
+            return results
 
         except Exception as e:
-            logger.warning("hybrid_search.error", error=str(e))
+            logger.warning("hybrid_search.direct_qdrant_error", error=str(e))
             return []

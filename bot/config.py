@@ -39,8 +39,8 @@ class Config(BaseSettings):
     ingest_batch_size: int = 5
     ingest_flush_interval: int = 60
     ingest_rate_limit_per_channel: int = 20
-    wiki_batch_size: int = 20
-    wiki_batch_timeout_seconds: int = 600
+    wiki_batch_size: int = 10
+    wiki_batch_timeout_seconds: int = 180
 
     # ─── Semantic Cache ───────────────────────────────────────────────────
     cache_similarity_threshold: float = 0.92

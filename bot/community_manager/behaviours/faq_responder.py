@@ -67,7 +67,9 @@ class FAQResponder:
             self.memory.search, event.content,
             agent_id=f"channel_{event.channel_id}", limit=8,
         )
-        wiki_pages = await self.wiki_reader.find_relevant_pages(event.content, max_pages=2)
+        wiki_pages = await self.wiki_reader.find_relevant_pages(
+            event.content, max_pages=2, guild_id=event.guild_id,
+        )
 
         results = facts.get("results", []) if isinstance(facts, dict) else facts
         if not results and not wiki_pages:
