@@ -14,25 +14,47 @@ from utils.logging_setup import get_logger
 
 logger = get_logger(__name__)
 
-# Pattern to detect @username mentions in a question
-# Matches both @username and plain username references
-MENTION_RE = re.compile(r"@(\w+)", re.IGNORECASE)
+# Pattern to detect Discord's raw mention format: <@USER_ID> or <@!USER_ID>
+DISCORD_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+# Pattern to detect plain @username mentions in a question
+PLAIN_MENTION_RE = re.compile(r"@(\w+)", re.IGNORECASE)
 
 
 class QueryCommandsCog(commands.Cog, name="Queries"):
     def __init__(self, bot):
         self.bot = bot
 
-    def _extract_mentioned_members(
+    def _resolve_question_mentions(
         self, question: str, guild: discord.Guild,
-    ) -> list[discord.Member]:
-        """Detect user mentions in the question text by matching against
-        guild members' display names and usernames."""
-        mentioned = []
-        question_lower = question.lower()
+    ) -> tuple[str, list[discord.Member]]:
+        """Detect user mentions in the question text and return a clean
+        question string + list of resolved members.
 
-        # Check explicit @mentions
-        for match in MENTION_RE.finditer(question):
+        Discord sends @mentions in slash-command string params as
+        ``<@USER_ID>`` or ``<@!USER_ID>``.  We resolve them to actual
+        guild members by ID AND replace the raw mention tag with the
+        human-readable display name so the LLM prompt reads naturally.
+
+        Also checks plain ``@username`` and bare ``username`` references
+        as a fallback.
+        """
+        mentioned: list[discord.Member] = []
+        cleaned_question = question
+
+        # --- Step 1: Resolve Discord <@ID> / <@!ID> mentions by user ID ---
+        for match in DISCORD_MENTION_RE.finditer(question):
+            user_id = int(match.group(1))
+            member = guild.get_member(user_id)
+            if member and not member.bot and member not in mentioned:
+                mentioned.append(member)
+                # Replace the raw <@ID> with the readable display name
+                cleaned_question = cleaned_question.replace(
+                    match.group(0), member.display_name,
+                )
+
+        # --- Step 2: Check plain @username mentions ---
+        for match in PLAIN_MENTION_RE.finditer(cleaned_question):
             name = match.group(1).lower()
             for member in guild.members:
                 if (member.display_name.lower() == name
@@ -40,16 +62,17 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                     if member not in mentioned and not member.bot:
                         mentioned.append(member)
 
-        # Also check plain name references (without @)
+        # --- Step 3: Check bare name references (no @ prefix) ---
+        cleaned_lower = cleaned_question.lower()
         for member in guild.members:
             if member.bot:
                 continue
-            if (member.display_name.lower() in question_lower
-                    or member.name.lower() in question_lower):
+            if (member.display_name.lower() in cleaned_lower
+                    or member.name.lower() in cleaned_lower):
                 if member not in mentioned:
                     mentioned.append(member)
 
-        return mentioned
+        return cleaned_question, mentioned
 
     @app_commands.command(name="ask", description="Ask the knowledge base a question")
     @app_commands.describe(
@@ -91,35 +114,41 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
             # 3. Determine search channel — default to current channel
             search_channel_id = channel.id if channel else interaction.channel.id
 
-            # 4. Hybrid search — channel-scoped semantic search + Qdrant fallback
-            facts = await self.bot.hybrid_search.query(
-                question, channel_id=search_channel_id,
-            )
-
-            # 5. User mention detection — fetch mentioned users' memories
-            user_facts = []
+            # 4. Resolve Discord mentions — convert <@USER_ID> to readable
+            #    names and detect mentioned members for memory lookup.
+            #    cleaned_question is used for all downstream search + LLM.
             mentioned_members = []
+            cleaned_question = question
             if interaction.guild:
-                mentioned_members = self._extract_mentioned_members(
+                cleaned_question, mentioned_members = self._resolve_question_mentions(
                     question, interaction.guild,
                 )
-                for member in mentioned_members:
-                    member_memories = await self.bot.hybrid_search.get_user_memories(
-                        member.id, guild_id=guild_id, limit=10,
-                    )
-                    user_facts.extend(member_memories)
-                    logger.info(
-                        "ask.user_mention_fetch",
-                        member=member.display_name,
-                        memories=len(member_memories),
-                    )
 
-            # 6. Channel fallback — if semantic search + user lookup returned
+            # 5. Hybrid search — channel-scoped semantic search + Qdrant fallback
+            #    guild_id ensures defense-in-depth isolation
+            facts = await self.bot.hybrid_search.query(
+                cleaned_question, channel_id=search_channel_id, guild_id=guild_id,
+            )
+
+            # 6. User mention lookup — fetch mentioned users' memories
+            user_facts = []
+            for member in mentioned_members:
+                member_memories = await self.bot.hybrid_search.get_user_memories(
+                    member.id, guild_id=guild_id, limit=10,
+                )
+                user_facts.extend(member_memories)
+                logger.info(
+                    "ask.user_mention_fetch",
+                    member=member.display_name,
+                    memories=len(member_memories),
+                )
+
+            # 7. Channel fallback — if semantic search + user lookup returned
             #    very few results, get recent channel memories for context
             channel_fallback = []
             if len(facts) + len(user_facts) < 3:
                 channel_fallback = await self.bot.hybrid_search.get_channel_memories(
-                    search_channel_id, limit=15,
+                    search_channel_id, guild_id=guild_id, limit=15,
                 )
                 logger.info(
                     "ask.channel_fallback",
@@ -127,12 +156,12 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                     memories=len(channel_fallback),
                 )
 
-            # 7. Wiki search (guild-scoped)
+            # 8. Wiki search (guild-scoped) — use cleaned question
             wiki_pages = await self.bot.wiki_reader.find_relevant_pages(
-                question, max_pages=3, guild_id=guild_id,
+                cleaned_question, max_pages=3, guild_id=guild_id,
             )
 
-            # 8. Combine all memory sources — deduplicate by memory text
+            # 9. Combine all memory sources — deduplicate by memory text
             all_facts = []
             seen_texts = set()
 
@@ -143,7 +172,7 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                         seen_texts.add(text)
                         all_facts.append(f)
 
-            # 9. Build context for LLM
+            # 10. Build context for LLM
             mem0_facts = "\n".join(
                 f"- {f.get('memory', '')}" for f in all_facts[:15]
             )
@@ -151,17 +180,18 @@ class QueryCommandsCog(commands.Cog, name="Queries"):
                 p.body[:600] for p in wiki_pages
             ) if wiki_pages else ""
 
-            # 10. LLM answer
+            # 11. LLM answer — use cleaned_question so the LLM sees
+            #     readable names, not raw <@ID> tags
             answer = await self.bot.llm_client.answer_question(
-                question=question,
+                question=cleaned_question,
                 mem0_facts=mem0_facts,
                 wiki_context=wiki_context,
             )
 
-            # 11. Store in cache
-            await self.bot.semantic_cache.store(question, answer, guild_id=guild_id)
+            # 12. Store in cache (keyed on cleaned question)
+            await self.bot.semantic_cache.store(cleaned_question, answer, guild_id=guild_id)
 
-            # 12. Build response
+            # 13. Build response
             source_info = (
                 f"Based on {len(all_facts)} facts + {len(wiki_pages)} wiki pages"
             )

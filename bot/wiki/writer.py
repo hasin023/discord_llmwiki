@@ -110,7 +110,14 @@ class WikiWriter:
                     await self.process_batch(batch)
 
     async def process_batch(self, batch: list[EnrichedMessageEvent]) -> None:
-        """Process a batch of enriched events into wiki pages."""
+        """Process a batch of enriched events into wiki pages.
+
+        SECURITY: Messages from different guilds may coexist in the same
+        batch because the WikiBuffer is shared.  We group by guild_id
+        FIRST so each guild's wiki pages are written to the correct
+        guild-scoped directory — this is enforced programmatically,
+        not via LLM prompts.
+        """
         if not batch:
             return
 
@@ -124,11 +131,25 @@ class WikiWriter:
             logger.warning("wiki.batch_skipped", reason="budget_exhausted", count=len(batch))
             return
 
-        logger.info("wiki.processing_batch", size=len(batch))
+        # SECURITY: Group by guild_id FIRST — never mix guilds in one wiki write.
+        from collections import defaultdict
+        by_guild: dict[int, list[EnrichedMessageEvent]] = defaultdict(list)
+        for event in batch:
+            by_guild[event.guild_id].append(event)
+
+        for guild_id, guild_batch in by_guild.items():
+            await self._process_guild_batch(guild_id, guild_batch)
+
+    async def _process_guild_batch(self, guild_id: int,
+                                    batch: list[EnrichedMessageEvent]) -> None:
+        """Process a single guild's batch of events into wiki pages.
+
+        All file writes are scoped to wiki/{guild_id}/ — guaranteed by
+        _guild_wiki_path().
+        """
+        logger.info("wiki.processing_batch", size=len(batch), guild_id=guild_id)
 
         try:
-            # Determine guild-scoped wiki path from the first event
-            guild_id = batch[0].guild_id
             wiki_path = self._guild_wiki_path(guild_id)
 
             # Step 1: Group messages by channel
@@ -153,10 +174,10 @@ class WikiWriter:
             await self._extract_entities_and_topics(wiki_path, batch)
 
             # Step 6: Log the operation
-            await self._log_operation(len(batch))
+            await self._log_operation(len(batch), guild_id=guild_id)
 
         except Exception as e:
-            logger.error("wiki.batch_error", error=str(e))
+            logger.error("wiki.batch_error", error=str(e), guild_id=guild_id)
 
     async def _update_channel_page(self, wiki_path: Path, channel_name: str,
                                     events: list[EnrichedMessageEvent]) -> None:
@@ -352,11 +373,12 @@ class WikiWriter:
                 text = text.rstrip()[:-3].rstrip()
         return text
 
-    async def _log_operation(self, count: int) -> None:
+    async def _log_operation(self, count: int, guild_id: int | str = None) -> None:
         """Append to wiki/log.md."""
         log_path = self.wiki_root / "log.md"
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        entry = f"\n- [{now}] Processed batch of {count} messages\n"
+        guild_tag = f" [guild={guild_id}]" if guild_id else ""
+        entry = f"\n- [{now}]{guild_tag} Processed batch of {count} messages\n"
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(entry)
